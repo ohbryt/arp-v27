@@ -126,20 +126,18 @@ Generate exactly 3 hypotheses in JSON format:
 """
     
     async def _call_llm(self, prompt: str) -> str:
-        """Call LLM for hypothesis generation"""
-        # This would integrate with Groq, Ollama, etc.
-        # Simplified for now
+        """Call LLM for hypothesis generation using Groq"""
         try:
-            from arp_v25.integration.groq_client import GroqClient
-            client = GroqClient()
-            response = await client.generate(
-                prompt=prompt,
-                model=self.model,
+            from integration.groq_client import client
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
                 temperature=0.2
             )
-            return response
-        except ImportError:
-            return "[]"  # Return empty if client not available
+            return response.choices[0].message.content
+        except Exception as e:
+            print(f"LLM call failed: {e}")
+            return "[]"
     
     def _parse_hypotheses(
         self,
