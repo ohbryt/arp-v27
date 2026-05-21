@@ -4,15 +4,13 @@ ARP v27 - Main Orchestrator
 ============================
 Unified orchestrator: v26 traceable OS + v24 pipeline + v25 self-healing
 
-Phase 4: Pipeline + Disease Packs Integration
-
 Usage:
     python3 arp_orchestrator.py discover DGAT1 --disease lung_cancer --depth full
     python3 arp_orchestrator.py hypothesis list
     python3 arp_orchestrator.py trace show <run_id>
 """
 
-import sys
+import asyncio
 import json
 import traceback
 from datetime import datetime
@@ -25,7 +23,7 @@ from core.hypothesis_manager import (
 )
 
 # Core v25 (Self-Healing)
-from core.self_healing.harness import SelfHealingHarness, ErrorType
+from core.self_healing.harness import SelfHealingHarness
 
 # v24 integrations
 from integration.groq_client import client, GROQ_MODELS
@@ -89,7 +87,7 @@ class ARP27Orchestrator:
     def discover(self, target: str, disease: str = "cancer", depth: str = "standard") -> Dict:
         """
         Discover drug candidates for target
-        Phase 4: Integrates v24 pipeline with v26/v25 orchestration
+        Integrates v24 pipeline with v26/v25 orchestration
         """
         print(f"\n🔬 ARP27 Discover: {target} ({disease}, {depth})")
         
@@ -112,72 +110,88 @@ class ARP27Orchestrator:
             # Step 1: Literature search (v24 integration)
             trace.log("literature_search", "PubMedSearch", 
                       f"Searching literature for {target}", f"disease={disease}")
-            lit_results = self.pubmed.search(target, disease)
-            results["evidence"]["literature"] = lit_results
-            print(f"   📚 Literature: {len(lit_results)} results")
+            try:
+                lit_results = self.pubmed.search(f'{target} {disease}', max_results=5)
+                results["evidence"]["literature"] = lit_results
+                print(f"   📚 Literature: {len(lit_results)} results")
+            except Exception as e:
+                print(f"   📚 Literature: error ({e})")
+                results["evidence"]["literature"] = []
             
-            # Step 2: DTI prediction (v24 integration)
+            # Step 2: DTI prediction (v24 integration)  
             trace.log("dti_prediction", "DTIPredictor",
                       f"Predicting drug-target interactions for {target}", "")
-            dti_results = self.dti.predict(target)
-            results["evidence"]["dti"] = dti_results
-            print(f"   🎯 DTI: {len(dti_results)} predictions")
+            try:
+                dti_results = self.dti.predict_dti(target, '', protein_sequence=None, ligand_smiles=None)
+                results["evidence"]["dti"] = dti_results
+                print(f"   🎯 DTI: predicted")
+            except Exception as e:
+                print(f"   🎯 DTI: error ({e})")
+                results["evidence"]["dti"] = {}
             
-            # Step 3: Generate hypotheses (v26 + v25)
+            # Step 3: Generate candidates (v24 pipeline)
+            trace.log("candidate_generation", "CandidateEngine",
+                      f"Generating candidates for {target}", f"disease={disease}")
+            try:
+                cand_result = self.candidate_engine.generate_candidates(target, disease)
+                candidates = cand_result.candidates if hasattr(cand_result, 'candidates') else []
+                results["candidates"] = [c.to_dict() for c in candidates[:5]] if candidates else []
+                print(f"   🏆 Candidates: {len(results['candidates'])} generated")
+                
+                # Print top candidates
+                for i, c in enumerate(results["candidates"][:3]):
+                    name = c.get('name', 'Unknown')
+                    stage = c.get('development_stage', 'unknown')
+                    score = c.get('composite_score', 0)
+                    print(f"      {i+1}. {name} ({stage}) - score: {score:.3f}")
+            except Exception as e:
+                print(f"   🏆 Candidates: error ({e})")
+                results["candidates"] = []
+            
+            # Step 4: Generate hypotheses (v26 + v25)
             trace.log("hypothesis_generation", "HypothesisAgent",
                       f"Generating hypotheses for {target}", "")
-            hypotheses = self.hypothesis_agent.generate(target, disease)
-            for h in hypotheses:
-                h_obj = self.hypothesis_manager.create(
-                    target=target,
-                    claim=h.description,
-                    source="hypothesis_agent"
-                )
-                h_obj.supporting_evidence = [f"Literature: {lit_results[:3]}"]
-                h_obj.conflicting_evidence = []
-                h_obj.missing_evidence = []
-                trace.log_hypothesis_generated(h_obj.id, h_obj.claim)
-                results["hypotheses"].append(h_obj.to_dict())
-            print(f"   💡 Hypotheses: {len(hypotheses)} generated")
+            try:
+                hyp_list = asyncio.run(self.hypothesis_agent.generate(target, disease))
+                if isinstance(hyp_list, list):
+                    hypotheses = hyp_list
+                else:
+                    hypotheses = []
+                
+                for h in hypotheses:
+                    h_obj = self.hypothesis_manager.create(
+                        target=target,
+                        claim=h.description if hasattr(h, 'description') else str(h),
+                        source="hypothesis_agent"
+                    )
+                    trace.log_hypothesis_generated(h_obj.id, h_obj.claim)
+                    results["hypotheses"].append(h_obj.to_dict())
+                print(f"   💡 Hypotheses: {len(hypotheses)} generated")
+            except Exception as e:
+                print(f"   💡 Hypotheses: error ({e})")
             
-            # Step 4: Score candidates (v24 pipeline)
-            trace.log("candidate_scoring", "CandidateEngine",
-                      f"Scoring candidates for {target}", "")
-            candidates = self.candidate_engine.score_candidates(target, dti_results)
-            results["candidates"] = candidates
-            print(f"   🏆 Candidates: {len(candidates)} scored")
-            
-            # Step 5: Rank hypotheses
-            for h in results["hypotheses"]:
-                conf = 0.5 + (0.1 * len(results["candidates"]))
-                self.hypothesis_manager.rank(h["id"], min(conf, 0.95))
+            # Step 5: Rank hypotheses by candidate scores
+            if results["candidates"]:
+                conf = 0.5 + (0.1 * min(len(results["candidates"]), 5))
+                for h in results["hypotheses"]:
+                    self.hypothesis_manager.rank(h["id"], min(conf, 0.95))
             
             # Complete
             trace.log("research_complete", "ARP27Orchestrator",
                       f"Discovery complete for {target}", 
-                      f"{len(hypotheses)} hypotheses, {len(candidates)} candidates")
+                      f"{len(results['hypotheses'])} hypotheses, {len(results['candidates'])} candidates")
             
             print(f"\n✅ Complete! Run ID: {trace.run_id}")
             print(f"   Hypotheses: {len(results['hypotheses'])}")
             print(f"   Candidates: {len(results['candidates'])}")
             
         except Exception as e:
-            # Self-healing: attempt recovery
-            error_record = self.self_healing.record_error(
-                ErrorType.API_ERROR,
-                str(e),
-                {"target": target, "disease": disease}
-            )
-            print(f"⚠️ Error occurred, self-healing: {error_record.error_id}")
+            print(f"⚠️ Error: {e}")
             trace.log("error", "ARP27Orchestrator", str(e), traceback.format_exc())
         
         # Save trace
         trace.save()
         return results
-    
-    def run_with_self_healing(self, func, *args, **kwargs):
-        """Run function with self-healing wrapper"""
-        return self.self_healing.execute(func, *args, **kwargs)
 
 
 def main():
@@ -256,7 +270,6 @@ def main():
     elif args.command == 'status':
         print(f"\n🔧 ARP v27 Status")
         print(f"   Hypotheses: {orchestrator.hypothesis_manager.get_active_count()}")
-        print(f"   Self-healing: {orchestrator.self_healing.metrics}")
         print(f"   Groq models: {list(GROQ_MODELS.keys())}")
     
     else:
